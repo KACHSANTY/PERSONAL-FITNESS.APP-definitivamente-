@@ -1,0 +1,1046 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, doc, deleteDoc, updateDoc, addDoc, query, where, getDocs } from 'firebase/firestore';
+import { Edit, Trash2, ArrowLeft, Download, Info, ChevronDown, ChevronUp } from 'lucide-react'; // Iconos de Lucide React
+
+// Mapeo de mediciones de inglés a español para mostrar en la UI
+const measurementLabels = {
+    neck: 'Cuello',
+    chest: 'Pecho',
+    rightArm: 'Brazo Derecho',
+    leftArm: 'Brazo Izquierdo',
+    waist: 'Cintura',
+    hips: 'Cadera',
+    rightThigh: 'Muslo Derecho',
+    leftThigh: 'Muslo Izquierdo',
+    rightCalf: 'Pantorrilla Derecha',
+    leftCalf: 'Pantorrilla Izquierda'
+};
+
+// Orden específico para mostrar las mediciones
+const measurementOrder = [
+    'neck', 'chest', 'rightArm', 'leftArm',
+    'waist', 'hips', 'rightThigh', 'leftThigh',
+    'rightCalf', 'leftCalf'
+];
+
+// Función auxiliar para calcular el estado de pago
+const calculatePaymentStatus = (paymentDateString) => {
+    if (!paymentDateString) return { text: 'Fecha de pago no registrada', color: 'text-gray-400', daysLeft: null };
+
+    const paymentDate = new Date(paymentDateString);
+    const dueDate = new Date(paymentDate);
+    dueDate.setDate(paymentDate.getDate() + 31); // 31 días desde la fecha de pago
+
+    const today = new Date();
+    // Establece horas, minutos, segundos, milisegundos a 0 para una comparación precisa por día
+    today.setHours(0, 0, 0, 0);
+    dueDate.setHours(0, 0, 0, 0);
+
+    const diffTime = dueDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    let statusText = '';
+    let statusColor = 'text-gray-200';
+
+    if (diffDays > 0) {
+        statusText = `Faltan ${diffDays} días para el vencimiento.`;
+        statusColor = 'text-green-400';
+    } else if (diffDays === 0) {
+        statusText = `¡Vence hoy!`;
+        statusColor = 'text-orange-400';
+    } else {
+        statusText = `Vencido por ${Math.abs(diffDays)} días.`;
+        statusColor = 'text-red-400';
+    }
+
+    return { text: statusText, color: statusColor, daysLeft: diffDays };
+};
+
+// Componente SplashScreen
+const SplashScreen = () => {
+    return (
+        <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 to-purple-900 text-white p-4">
+            <div className="text-center">
+                <h1 className="text-5xl md:text-6xl font-extrabold animate-pulse tracking-wide font-['Inter']">
+                    Personal Fitness
+                </h1>
+                <p className="mt-4 text-lg md:text-xl animate-fade-in-up font-['Inter']">Cargando tu experiencia...</p>
+                <div className="mt-8 flex justify-center">
+                    <div className="loader ease-linear rounded-full border-8 border-t-8 border-purple-600 h-20 w-20 md:h-24 md:w-24"></div>
+                </div>
+            </div>
+
+            <style jsx>{`
+                .loader {
+                    border-top-color: #8B5CF6; /* Purple-500 */
+                    -webkit-animation: spin 1.5s linear infinite;
+                    animation: spin 1.5s linear infinite;
+                }
+
+                @-webkit-keyframes spin {
+                    0% { -webkit-transform: rotate(0deg); }
+                    100% { -webkit-transform: rotate(360deg); }
+                }
+
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+
+                @keyframes fade-in-up {
+                    from {
+                        opacity: 0;
+                        transform: translateY(20px);
+                    }
+                    to {
+                        opacity: 1;
+                        transform: translateY(0);
+                    }
+                }
+
+                .animate-fade-in-up {
+                    animation: fade-in-up 1s ease-out forwards;
+                }
+            `}</style>
+        </div>
+    );
+};
+
+// Componente Modal (reutilizable para confirmaciones y edición)
+const Modal = ({ isOpen, onClose, title, children }) => {
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-gray-800 rounded-xl shadow-2xl p-6 w-full max-w-md transform transition-all duration-300 scale-100 opacity-100 my-8 border border-purple-700">
+                <div className="flex justify-between items-center mb-4">
+                    <h2 className="text-xl md:text-2xl font-bold text-purple-400">{title}</h2>
+                    <button
+                        onClick={onClose}
+                        className="text-gray-400 hover:text-purple-300 text-3xl font-light leading-none"
+                    >
+                        &times;
+                    </button>
+                </div>
+                <div className="text-gray-200 max-h-[70vh] overflow-y-auto pr-2"> {/* Permite desplazamiento dentro del modal */}
+                    {children}
+                </div>
+                <div className="mt-6 flex justify-end">
+                    <button
+                        onClick={onClose}
+                        className="bg-purple-700 hover:bg-purple-800 text-white font-bold py-2 px-6 rounded-lg shadow-md transition-all duration-200"
+                    >
+                        Cerrar
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// Componente RegistrationForm (Incluye también los botones de navegación a otras secciones)
+const RegistrationForm = ({ db, setCurrentScreen, appId }) => {
+    const [name, setName] = useState('');
+    const [email, setEmail] = useState('');
+    const [phone, setPhone] = useState('');
+    const [isAdult, setIsAdult] = useState(true);
+    const [paymentDate, setPaymentDate] = useState('');
+    const [showSuccessModal, setShowSuccessModal] = useState(false);
+    const [registeredName, setRegisteredName] = useState('');
+    const [errorMessage, setErrorMessage] = useState('');
+    const [isRegistering, setIsRegistering] = useState(false); // Estado para la animación de carga
+
+    const handleRegister = async (e) => {
+        e.preventDefault();
+        setErrorMessage('');
+
+        if (!name || !email || !phone || !paymentDate) {
+            setErrorMessage('Por favor, complete todos los campos.');
+            return;
+        }
+
+        if (!db) {
+            setErrorMessage('La base de datos no está disponible. Intente de nuevo más tarde.');
+            return;
+        }
+
+        setIsRegistering(true); // Inicia la animación de carga
+
+        try {
+            const clientsCollectionRef = collection(db, `artifacts/${appId}/public/data/clients`);
+
+            await addDoc(clientsCollectionRef, {
+                name: name,
+                email: email,
+                phone: phone,
+                isAdult: isAdult,
+                paymentDate: paymentDate,
+                measurements: { // Inicializa mediciones vacías
+                    neck: '', chest: '', leftArm: '', rightArm: '',
+                    waist: '', hips: '', leftThigh: '', rightThigh: '',
+                    leftCalf: '', rightCalf: ''
+                }
+            });
+
+            setRegisteredName(name);
+            setShowSuccessModal(true);
+            // Limpia los campos del formulario
+            setName('');
+            setEmail('');
+            setPhone('');
+            setIsAdult(true);
+            setPaymentDate('');
+        } catch (error) {
+            console.error("Error al registrar el cliente:", error);
+            setErrorMessage('Error al registrar. Por favor, intente de nuevo.');
+        } finally {
+            setIsRegistering(false); // Finaliza la animación de carga
+        }
+    };
+
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 to-purple-900 p-4 font-['Inter'] text-white">
+            <div className="bg-gray-800 p-6 md:p-8 rounded-xl shadow-2xl w-full max-w-md border border-purple-700">
+                <h2 className="text-2xl md:text-3xl font-bold text-center text-purple-400 mb-6 md:mb-8">Registro de Cliente</h2>
+                <form onSubmit={handleRegister} className="space-y-4 md:space-y-6">
+                    <div>
+                        <label htmlFor="name" className="block text-gray-300 text-sm font-semibold mb-2">Nombre:</label>
+                        <input
+                            type="text"
+                            id="name"
+                            className="w-full px-3 py-2 md:px-4 md:py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200"
+                            value={name}
+                            onChange={(e) => setName(e.target.value)}
+                            required
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="email" className="block text-gray-300 text-sm font-semibold mb-2">Correo:</label>
+                        <input
+                            type="email"
+                            id="email"
+                            className="w-full px-3 py-2 md:px-4 md:py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200"
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            required
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="phone" className="block text-gray-300 text-sm font-semibold mb-2">Número de Teléfono:</label>
+                        <input
+                            type="tel"
+                            id="phone"
+                            className="w-full px-3 py-2 md:px-4 md:py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200"
+                            value={phone}
+                            onChange={(e) => setPhone(e.target.value)}
+                            required
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-gray-300 text-sm font-semibold mb-2">Edad:</label>
+                        <div className="flex items-center space-x-4">
+                            <label className="inline-flex items-center">
+                                <input
+                                    type="radio"
+                                    name="age"
+                                    value="adult"
+                                    checked={isAdult === true}
+                                    onChange={() => setIsAdult(true)}
+                                    className="form-radio text-purple-600"
+                                />
+                                <span className="ml-2 text-gray-300 text-sm">Mayor de edad</span>
+                            </label>
+                            <label className="inline-flex items-center">
+                                <input
+                                    type="radio"
+                                    name="age"
+                                    value="minor"
+                                    checked={isAdult === false}
+                                    onChange={() => setIsAdult(false)}
+                                    className="form-radio text-purple-600"
+                                />
+                                <span className="ml-2 text-gray-300 text-sm">Menor de edad</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div>
+                        <label htmlFor="paymentDate" className="block text-gray-300 text-sm font-semibold mb-2">Fecha de Pago (Inicio de membresía):</label>
+                        <input
+                            type="date"
+                            id="paymentDate"
+                            className="w-full px-3 py-2 md:px-4 md:py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200"
+                            value={paymentDate}
+                            onChange={(e) => setPaymentDate(e.target.value)}
+                            required
+                        />
+                    </div>
+                    {errorMessage && (
+                        <p className="text-red-500 text-sm text-center">{errorMessage}</p>
+                    )}
+                    <button
+                        type="submit"
+                        className={`w-full py-3 px-4 rounded-lg shadow-xl transform transition-all duration-200
+                                   bg-gradient-to-br from-purple-600 to-purple-800 text-white font-bold text-lg
+                                   hover:from-purple-700 hover:to-purple-900 hover:scale-105 active:translate-y-1 active:shadow-md
+                                   relative overflow-hidden group border border-purple-500
+                                   ${isRegistering ? 'animate-pulse cursor-not-allowed' : ''}`}
+                        disabled={isRegistering} // Deshabilita el botón mientras carga
+                    >
+                        <span className="relative z-10">
+                            {isRegistering ? 'Registrando...' : 'Registrar'}
+                        </span>
+                        <span className="absolute inset-0 bg-white opacity-0 group-hover:opacity-10 transition-opacity duration-200"></span>
+                    </button>
+                </form>
+
+                <div className="mt-8 space-y-4 pt-4 border-t border-gray-700">
+                    <p className="text-gray-400 text-center text-md mb-4">Otras opciones:</p>
+                    <button
+                        onClick={() => setCurrentScreen('myStats')}
+                        className="w-full py-3 px-6 rounded-lg shadow-lg transform transition-all duration-200
+                                   bg-gradient-to-br from-gray-700 to-gray-900 text-purple-300 font-semibold text-lg
+                                   hover:from-gray-600 hover:to-gray-800 hover:scale-105 active:translate-y-1 active:shadow-md
+                                   relative overflow-hidden group border border-gray-600"
+                    >
+                        <span className="relative z-10">Mis Estadísticas</span>
+                        <span className="absolute inset-0 bg-purple-500 opacity-0 group-hover:opacity-10 transition-opacity duration-200"></span>
+                    </button>
+                    <button
+                        onClick={() => setCurrentScreen('admin')}
+                        className="w-full py-2 px-4 rounded-lg shadow-md transform transition-all duration-200
+                                   bg-gradient-to-br from-gray-900 to-black text-gray-500 font-normal text-base
+                                   hover:from-gray-800 hover:to-gray-900 hover:scale-105 active:translate-y-1 active:shadow-sm
+                                   relative overflow-hidden group opacity-80 hover:opacity-100 border border-gray-700"
+                    >
+                        <span className="relative z-10">Admin</span>
+                        <span className="absolute inset-0 bg-purple-500 opacity-0 group-hover:opacity-5 transition-opacity duration-200"></span>
+                    </button>
+                </div>
+            </div>
+
+            <Modal
+                isOpen={showSuccessModal}
+                onClose={() => setShowSuccessModal(false)}
+                title="Registro Exitoso"
+            >
+                <p className="text-lg text-center text-gray-200">¡Registrado con éxito!</p>
+                <p className="text-xl font-semibold text-center mt-2 text-purple-300">Bienvenido a Personal Fitness, {registeredName}.</p>
+            </Modal>
+        </div>
+    );
+};
+
+// Componente AdminDashboard
+const AdminDashboard = ({ db, userId, setCurrentScreen, appId }) => {
+    const [password, setPassword] = useState('');
+    const [loggedIn, setLoggedIn] = useState(false);
+    const [clients, setClients] = useState([]);
+    const [selectedClient, setSelectedClient] = useState(null); // Usado para el modal de edición
+    const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+    const [isDeleteConfirmModalOpen, setIsDeleteConfirmModalOpen] = useState(false);
+    const [clientToDelete, setClientToDelete] = useState(null);
+    const [editClientData, setEditClientData] = useState({});
+    const [adminError, setAdminError] = useState('');
+    const [showDueSoonClients, setShowDueSoonClients] = useState(false); // Estado para el filtro 'Por Vencer'
+    const [searchTerm, setSearchTerm] = useState(''); // Estado para la búsqueda por nombre
+    const [expandedClientId, setExpandedClientId] = useState(null); // Estado para gestionar la fila expandida/contraída
+
+    const ADMIN_PASSWORD = "Personal"; // Contraseña de administrador
+
+    useEffect(() => {
+        if (!loggedIn || !db || !userId) return;
+
+        const clientsCollectionRef = collection(db, `artifacts/${appId}/public/data/clients`);
+
+        const unsubscribe = onSnapshot(clientsCollectionRef, (snapshot) => {
+            const clientsData = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            setClients(clientsData);
+        }, (error) => {
+            console.error("Error al cargar clientes:", error);
+            setAdminError("Error al cargar clientes.");
+        });
+
+        return () => unsubscribe();
+    }, [loggedIn, db, userId, appId]);
+
+    const handleLogin = (e) => {
+        e.preventDefault();
+        setAdminError('');
+        if (password === ADMIN_PASSWORD) {
+            setLoggedIn(true);
+        } else {
+            setAdminError("Contraseña incorrecta.");
+        }
+    };
+
+    const handleEditClick = (client) => {
+        setSelectedClient(client);
+        setEditClientData({
+            name: client.name,
+            email: client.email,
+            phone: client.phone,
+            isAdult: client.isAdult,
+            paymentDate: client.paymentDate,
+            measurements: client.measurements || { // Asegura que las mediciones existan al cargar para edición
+                neck: '', chest: '', leftArm: '', rightArm: '',
+                waist: '', hips: '', leftThigh: '', rightThigh: '',
+                leftCalf: '', rightCalf: ''
+            }
+        });
+        setIsEditModalOpen(true);
+    };
+
+    const handleSaveClient = async () => {
+        if (!selectedClient || !db) return;
+
+        try {
+            const clientDocRef = doc(db, `artifacts/${appId}/public/data/clients`, selectedClient.id);
+            await updateDoc(clientDocRef, editClientData);
+            setIsEditModalOpen(false);
+            setSelectedClient(null);
+            setAdminError('');
+        } catch (error) {
+            console.error("Error al guardar cliente:", error);
+            setAdminError("Error al guardar los cambios del cliente.");
+        }
+    };
+
+    const handleDeleteClick = (client) => {
+        setClientToDelete(client);
+        setIsDeleteConfirmModalOpen(true);
+    };
+
+    const confirmDelete = async () => {
+        if (!clientToDelete || !db) return;
+
+        try {
+            const clientDocRef = doc(db, `artifacts/${appId}/public/data/clients`, clientToDelete.id);
+            await deleteDoc(clientDocRef);
+            setIsDeleteConfirmModalOpen(false);
+            setClientToDelete(null);
+            setAdminError('');
+        } catch (error) {
+            console.error("Error al eliminar cliente:", error);
+            setAdminError("Error al eliminar cliente.");
+        }
+    };
+
+    // Alterna la expansión de la fila de un cliente
+    const toggleExpandClient = (clientId) => {
+        setExpandedClientId(prevId => (prevId === clientId ? null : clientId));
+    };
+
+    // Maneja la descarga de la lista de clientes en CSV
+    const handleDownloadClients = () => {
+        if (clients.length === 0) {
+            setAdminError("No hay clientes para descargar.");
+            return;
+        }
+
+        const headers = [
+            "Nombre", "Correo", "Teléfono", "Mayor de Edad", "Fecha de Pago",
+            ...measurementOrder.map(key => measurementLabels[key]) // Usa las etiquetas de mediciones ordenadas
+        ];
+
+        const csvRows = [];
+        csvRows.push(headers.join(','));
+
+        clients.forEach(client => {
+            const measurements = client.measurements || {};
+            const row = [
+                `"${client.name}"`,
+                `"${client.email}"`,
+                `"${client.phone}"`,
+                client.isAdult ? "Sí" : "No",
+                client.paymentDate,
+                ...measurementOrder.map(key => measurements[key] || '') // Usa las claves de mediciones ordenadas
+            ].map(item => {
+                // Escapa comas y saltos de línea dentro de los campos CSV
+                if (typeof item === 'string' && item.includes(',')) {
+                    return `"${item.replace(/"/g, '""')}"`;
+                }
+                return item;
+            });
+            csvRows.push(row.join(','));
+        });
+
+        const csvString = csvRows.join('\n');
+        const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.setAttribute('download', 'clientes_personal_fitness.csv');
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setAdminError('');
+    };
+
+    // Filtra clientes basándose en el filtro 'Por Vencer' y el término de búsqueda por nombre
+    const filteredClients = clients.filter(client => {
+        const matchesDueSoon = showDueSoonClients
+            ? (calculatePaymentStatus(client.paymentDate).daysLeft !== null &&
+               calculatePaymentStatus(client.paymentDate).daysLeft <= 3 &&
+               calculatePaymentStatus(client.paymentDate).daysLeft >= 0)
+            : true; // Si no se filtra por "por vencer", todos los clientes cumplen esta condición
+
+        const matchesSearchTerm = searchTerm.trim() === ''
+            ? true
+            : client.name.toLowerCase().includes(searchTerm.toLowerCase());
+
+        return matchesDueSoon && matchesSearchTerm;
+    });
+
+    if (!loggedIn) {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 to-purple-900 p-4 text-white font-['Inter']">
+                <div className="bg-gray-800 p-6 md:p-8 rounded-xl shadow-2xl w-full max-w-sm border border-purple-700">
+                    <h2 className="text-2xl md:text-3xl font-bold text-center text-purple-400 mb-6 md:mb-8">Acceso de Administrador</h2>
+                    <form onSubmit={handleLogin} className="space-y-4 md:space-y-6">
+                        <div>
+                            <label htmlFor="adminPassword" className="block text-gray-300 text-sm font-semibold mb-2">Contraseña:</label>
+                            <input
+                                type="password"
+                                id="adminPassword"
+                                className="w-full px-3 py-2 md:px-4 md:py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200"
+                                value={password}
+                                onChange={(e) => setPassword(e.target.value)}
+                                required
+                            />
+                        </div>
+                        {adminError && (
+                            <p className="text-red-500 text-sm text-center">{adminError}</p>
+                        )}
+                        <button
+                            type="submit"
+                            className="w-full py-3 px-4 rounded-lg shadow-xl transform transition-all duration-200
+                                       bg-gradient-to-br from-purple-600 to-purple-800 text-white font-bold text-lg
+                                       hover:from-purple-700 hover:to-purple-900 hover:scale-105 active:translate-y-1 active:shadow-md
+                                       relative overflow-hidden group border border-purple-500"
+                        >
+                            <span className="relative z-10">Ingresar</span>
+                            <span className="absolute inset-0 bg-white opacity-0 group-hover:opacity-10 transition-opacity duration-200"></span>
+                        </button>
+                    </form>
+                    <button
+                        onClick={() => setCurrentScreen('register')} // Volver a la pantalla de registro
+                        className="mt-6 w-full py-3 px-4 rounded-lg shadow-md transform transition-all duration-200
+                                   bg-gray-700 hover:bg-gray-600 text-gray-300 font-semibold text-lg
+                                   hover:scale-105 active:translate-y-1 active:shadow-sm
+                                   relative overflow-hidden group border border-gray-600"
+                    >
+                        <span className="relative z-10">Volver al Registro</span>
+                        <span className="absolute inset-0 bg-purple-500 opacity-0 group-hover:opacity-5 transition-opacity duration-200"></span>
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="flex flex-col items-center min-h-screen bg-gradient-to-br from-gray-900 to-purple-900 p-4 text-white font-['Inter']">
+            <div className="bg-gray-800 p-6 md:p-8 rounded-xl shadow-2xl w-full max-w-4xl mt-4 md:mt-8 border border-purple-700">
+                <div className="flex flex-col md:flex-row justify-between items-center mb-6 md:mb-8">
+                    <h2 className="text-2xl md:text-3xl font-bold text-purple-400 mb-4 md:mb-0">Panel de Administrador</h2>
+                    <div className="flex flex-wrap justify-center md:justify-end gap-2">
+                        {/* Campo de búsqueda por nombre */}
+                        <input
+                            type="text"
+                            placeholder="Buscar por nombre..."
+                            className="px-3 py-2 rounded-lg border border-gray-600 bg-gray-700 text-white placeholder-gray-400 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200 w-full md:w-auto"
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                        />
+                        {/* Botón para filtrar clientes 'Por Vencer' */}
+                        <button
+                            onClick={() => setShowDueSoonClients(!showDueSoonClients)}
+                            className={`py-2 px-4 rounded-lg shadow-md transition-all duration-200 flex items-center text-sm md:text-base
+                                        ${showDueSoonClients ? 'bg-orange-600 hover:bg-orange-700 text-white' : 'bg-yellow-600 hover:bg-yellow-700 text-white'}`}
+                            title="Ver Clientes por Vencer"
+                        >
+                            <Info className="mr-2" size={20} /> {showDueSoonClients ? 'Ver Todos' : 'Por Vencer'}
+                        </button>
+                        {/* Botón para descargar clientes */}
+                        <button
+                            onClick={handleDownloadClients}
+                            className="bg-green-700 hover:bg-green-800 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 flex items-center text-sm md:text-base"
+                            title="Descargar Clientes"
+                        >
+                            <Download className="mr-2" size={20} /> Descargar
+                        </button>
+                        {/* Botón para volver al registro */}
+                        <button
+                            onClick={() => setCurrentScreen('register')}
+                            className="bg-gray-700 hover:bg-gray-600 text-gray-300 font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 flex items-center text-sm md:text-base"
+                        >
+                            <ArrowLeft className="mr-2" size={20} /> Volver
+                        </button>
+                    </div>
+                </div>
+
+                {adminError && (
+                    <p className="text-red-500 text-sm text-center mb-4">{adminError}</p>
+                )}
+
+                {filteredClients.length === 0 ? (
+                    <p className="text-gray-400 text-center text-lg">No hay clientes que coincidan con la búsqueda o el filtro.</p>
+                ) : (
+                    <div className="overflow-x-auto rounded-lg shadow-md border border-gray-700">
+                        <table className="min-w-full bg-gray-900 text-gray-200">
+                            <thead>
+                                <tr className="bg-gray-700 text-purple-300 uppercase text-sm leading-normal">
+                                    <th className="py-3 px-4 text-left">Nombre</th>
+                                    <th className="py-3 px-4 text-left hidden md:table-cell">Correo</th>
+                                    <th className="py-3 px-4 text-left hidden md:table-cell">Teléfono</th>
+                                    <th className="py-3 px-4 text-center">Acciones</th>
+                                </tr>
+                            </thead>
+                            <tbody className="text-gray-200 text-sm font-light">
+                                {filteredClients.map((client) => (
+                                    <React.Fragment key={client.id}>
+                                        <tr className="border-b border-gray-700 hover:bg-gray-800">
+                                            <td className="py-3 px-4 text-left whitespace-nowrap">
+                                                {/* Botón para expandir/contraer la información del cliente */}
+                                                <button
+                                                    onClick={() => toggleExpandClient(client.id)}
+                                                    className="flex items-center text-purple-300 hover:text-purple-400 font-bold"
+                                                >
+                                                    {client.name}
+                                                    {expandedClientId === client.id ? (
+                                                        <ChevronUp size={16} className="ml-2" />
+                                                    ) : (
+                                                        <ChevronDown size={16} className="ml-2" />
+                                                    )}
+                                                </button>
+                                            </td>
+                                            <td className="py-3 px-4 text-left hidden md:table-cell">{client.email}</td>
+                                            <td className="py-3 px-4 text-left hidden md:table-cell">{client.phone}</td>
+                                            <td className="py-3 px-4 text-center">
+                                                <div className="flex item-center justify-center space-x-2">
+                                                    {/* Botón de edición */}
+                                                    <button
+                                                        onClick={() => handleEditClick(client)}
+                                                        className="w-8 h-8 rounded-full bg-purple-700 hover:bg-purple-600 text-white flex items-center justify-center transition-all duration-200"
+                                                        title="Editar"
+                                                    >
+                                                        <Edit size={18} />
+                                                    </button>
+                                                    {/* Botón de eliminación */}
+                                                    <button
+                                                        onClick={() => handleDeleteClick(client)}
+                                                        className="w-8 h-8 rounded-full bg-red-700 hover:bg-red-600 text-white flex items-center justify-center transition-all duration-200"
+                                                        title="Eliminar"
+                                                    >
+                                                        <Trash2 size={18} />
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                        {/* Fila expandida con la información detallada del cliente */}
+                                        {expandedClientId === client.id && (
+                                            <tr className="bg-gray-800 border-b border-gray-700">
+                                                <td colSpan="4" className="p-4">
+                                                    <div className="space-y-3 text-gray-200 text-sm">
+                                                        <p className="md:hidden"><strong>Correo:</strong> {client.email || 'N/A'}</p>
+                                                        <p className="md:hidden"><strong>Teléfono:</strong> {client.phone || 'N/A'}</p>
+                                                        <p><strong>Edad:</strong> {client.isAdult ? 'Mayor de edad' : 'Menor de edad'}</p>
+                                                        <p><strong>Fecha de Inicio de Membresía:</strong> {client.paymentDate || 'N/A'}</p>
+                                                        {calculatePaymentStatus(client.paymentDate).text && (
+                                                            <p className={calculatePaymentStatus(client.paymentDate).color}>
+                                                                {calculatePaymentStatus(client.paymentDate).text}
+                                                            </p>
+                                                        )}
+
+                                                        <h4 className="text-lg font-bold text-purple-400 mt-4 mb-2">Mediciones Corporales:</h4>
+                                                        {/* Verifica si hay mediciones registradas para mostrar el mensaje */}
+                                                        {client.measurements && measurementOrder.some(key => client.measurements[key]) ? (
+                                                            <ul className="list-disc list-inside space-y-1 text-gray-300">
+                                                                {measurementOrder.map((key) => (
+                                                                    <li key={key}>
+                                                                        <strong className="capitalize">
+                                                                            {measurementLabels[key] || key}:
+                                                                        </strong> {client.measurements[key] || 'No registrado'}
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        ) : (
+                                                            <p className="text-gray-400 italic">Aún no se han agregado mediciones para este perfil.</p>
+                                                        )}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </React.Fragment>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+
+            {/* Modal de Edición de Cliente (Mantiene su funcionalidad) */}
+            <Modal
+                isOpen={isEditModalOpen}
+                onClose={() => setIsEditModalOpen(false)}
+                title={`Editar Cliente: ${selectedClient?.name || ''}`}
+            >
+                {selectedClient && (
+                    <div className="space-y-4">
+                        {/* Campos de información básica para edición */}
+                        <div>
+                            <label htmlFor="editName" className="block text-gray-300 text-sm font-semibold mb-1">Nombre:</label>
+                            <input
+                                type="text"
+                                id="editName"
+                                className="w-full px-3 py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-1 focus:ring-purple-500"
+                                value={editClientData.name}
+                                onChange={(e) => setEditClientData({ ...editClientData, name: e.target.value })}
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="editEmail" className="block text-gray-300 text-sm font-semibold mb-1">Correo:</label>
+                            <input
+                                type="email"
+                                id="editEmail"
+                                className="w-full px-3 py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-1 focus:ring-purple-500"
+                                value={editClientData.email}
+                                onChange={(e) => setEditClientData({ ...editClientData, email: e.target.value })}
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="editPhone" className="block text-gray-300 text-sm font-semibold mb-1">Teléfono:</label>
+                            <input
+                                type="tel"
+                                id="editPhone"
+                                className="w-full px-3 py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-1 focus:ring-purple-500"
+                                value={editClientData.phone}
+                                onChange={(e) => setEditClientData({ ...editClientData, phone: e.target.value })}
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-gray-300 text-sm font-semibold mb-1">Edad:</label>
+                            <div className="flex items-center space-x-4">
+                                <label className="inline-flex items-center">
+                                    <input
+                                        type="radio"
+                                        name="editAge"
+                                        value="adult"
+                                        checked={editClientData.isAdult === true}
+                                        onChange={() => setEditClientData({ ...editClientData, isAdult: true })}
+                                        className="form-radio text-purple-600"
+                                    />
+                                    <span className="ml-2 text-gray-300 text-sm">Mayor de edad</span>
+                                </label>
+                                <label className="inline-flex items-center">
+                                    <input
+                                        type="radio"
+                                        name="editAge"
+                                        value="minor"
+                                        checked={editClientData.isAdult === false}
+                                        onChange={() => setEditClientData({ ...editClientData, isAdult: false })}
+                                        className="form-radio text-purple-600"
+                                    />
+                                    <span className="ml-2 text-gray-300 text-sm">Menor de edad</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div>
+                            <label htmlFor="editPaymentDate" className="block text-gray-300 text-sm font-semibold mb-1">Fecha de Pago:</label>
+                            <input
+                                type="date"
+                                id="editPaymentDate"
+                                className="w-full px-3 py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-1 focus:ring-purple-500"
+                                value={editClientData.paymentDate}
+                                onChange={(e) => setEditClientData({ ...editClientData, paymentDate: e.target.value })}
+                            />
+                        </div>
+
+                        <h3 className="text-xl font-bold text-purple-400 mt-6 mb-4">Mediciones Corporales</h3>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            {measurementOrder.map((key) => ( // Usa el array ordenado para renderizar los campos de medición
+                                <div key={key}>
+                                    <label htmlFor={key} className="block text-gray-300 text-sm font-semibold mb-1 capitalize">
+                                        {measurementLabels[key] || key}:
+                                    </label>
+                                    <input
+                                        type="text"
+                                        id={key}
+                                        className="w-full px-3 py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-1 focus:ring-purple-500"
+                                        value={editClientData.measurements[key]}
+                                        onChange={(e) => setEditClientData({
+                                            ...editClientData,
+                                            measurements: { ...editClientData.measurements, [key]: e.target.value }
+                                        })}
+                                    />
+                                </div>
+                            ))}
+                        </div>
+                        {adminError && (
+                            <p className="text-red-500 text-sm text-center mt-4">{adminError}</p>
+                        )}
+                        <div className="flex justify-end mt-6">
+                            <button
+                                onClick={handleSaveClient}
+                                className="bg-purple-700 hover:bg-purple-800 text-white font-bold py-2 px-6 rounded-lg shadow-md transition-all duration-200"
+                            >
+                                Guardar Cambios
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </Modal>
+
+            {/* Modal de Confirmación de Eliminación (Mantiene su funcionalidad) */}
+            <Modal
+                isOpen={isDeleteConfirmModalOpen}
+                onClose={() => setIsDeleteConfirmModalOpen(false)}
+                title="Confirmar Eliminación"
+            >
+                <p className="text-lg text-center text-gray-200">
+                    ¿Estás seguro de que quieres eliminar a <span className="font-semibold text-purple-300">{clientToDelete?.name}</span>? Esta acción es irreversible.
+                </p>
+                <div className="flex justify-center space-x-4 mt-6">
+                    <button
+                        onClick={() => setIsDeleteConfirmModalOpen(false)}
+                        className="bg-gray-600 hover:bg-gray-500 text-gray-200 font-bold py-2 px-6 rounded-lg shadow-md transition-all duration-200"
+                    >
+                        Cancelar
+                    </button>
+                    <button
+                        onClick={confirmDelete}
+                        className="bg-red-700 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg shadow-md transition-all duration-200"
+                    >
+                        Eliminar
+                    </button>
+                </div>
+            </Modal>
+        </div>
+    );
+};
+
+// Componente MyStatistics
+const MyStatistics = ({ db, setCurrentScreen, appId }) => {
+    const [clientName, setClientName] = useState('');
+    const [clientData, setClientData] = useState(null);
+    const [searchError, setSearchError] = useState('');
+
+    const handleSearch = async (e) => {
+        e.preventDefault();
+        setClientData(null);
+        setSearchError('');
+
+        if (!clientName) {
+            setSearchError('Por favor, ingrese su nombre.');
+            return;
+        }
+        if (!db) {
+            setSearchError('La base de datos no está disponible. Intente de nuevo más tarde.');
+            return;
+        }
+
+        try {
+            const clientsCollectionRef = collection(db, `artifacts/${appId}/public/data/clients`);
+            // Se recuperan todos los clientes para filtrar en el cliente de forma insensible a mayúsculas/minúsculas
+            const q = query(clientsCollectionRef);
+            const querySnapshot = await getDocs(q);
+
+            let foundClient = null;
+            querySnapshot.forEach((doc) => {
+                const data = doc.data();
+                // Realiza la búsqueda insensible a mayúsculas/minúsculas
+                if (data.name && data.name.toLowerCase() === clientName.toLowerCase()) {
+                    foundClient = data;
+                }
+            });
+
+            if (foundClient) {
+                setClientData(foundClient);
+            } else {
+                setSearchError('Cliente no encontrado. Verifique el nombre.');
+            }
+        } catch (error) {
+            console.error("Error al buscar cliente:", error);
+            setSearchError('Error al buscar cliente. Por favor, intente de nuevo.');
+        }
+    };
+
+    return (
+        <div className="flex flex-col items-center min-h-screen bg-gradient-to-br from-gray-900 to-purple-900 p-4 text-white font-['Inter']">
+            <div className="bg-gray-800 p-6 md:p-8 rounded-xl shadow-2xl w-full max-w-md mt-4 md:mt-8 border border-purple-700">
+                <div className="flex justify-between items-center mb-6 md:mb-8">
+                    <h2 className="text-2xl md:text-3xl font-bold text-purple-400">Mis Estadísticas</h2>
+                    <button
+                        onClick={() => setCurrentScreen('register')} // Volver a la pantalla de registro
+                        className="bg-gray-700 hover:bg-gray-600 text-gray-300 font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 flex items-center text-sm md:text-base"
+                    >
+                        <ArrowLeft className="mr-2" size={20} /> Volver
+                    </button>
+                </div>
+
+                <form onSubmit={handleSearch} className="space-y-4 mb-8">
+                    <div>
+                        <label htmlFor="clientNameSearch" className="block text-gray-300 text-sm font-semibold mb-2">Ingrese su Nombre:</label>
+                        <input
+                            type="text"
+                            id="clientNameSearch"
+                            className="w-full px-3 py-2 md:px-4 md:py-2 border border-gray-600 rounded-lg bg-gray-700 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all duration-200"
+                            value={clientName}
+                            onChange={(e) => setClientName(e.target.value)}
+                            required
+                        />
+                    </div>
+                    {searchError && (
+                        <p className="text-red-500 text-sm text-center">{searchError}</p>
+                    )}
+                    <button
+                        type="submit"
+                        className="w-full py-3 px-4 rounded-lg shadow-xl transform transition-all duration-200
+                                   bg-gradient-to-br from-purple-600 to-purple-800 text-white font-bold text-lg
+                                   hover:from-purple-700 hover:to-purple-900 hover:scale-105 active:translate-y-1 active:shadow-md
+                                   relative overflow-hidden group border border-purple-500"
+                    >
+                        <span className="relative z-10">Ver Estadísticas</span>
+                        <span className="absolute inset-0 bg-white opacity-0 group-hover:opacity-10 transition-opacity duration-200"></span>
+                    </button>
+                </form>
+
+                {clientData && (
+                    <div className="bg-gray-900 p-6 rounded-lg shadow-inner border border-purple-700">
+                        <h3 className="text-xl md:text-2xl font-bold text-purple-400 mb-4">{clientData.name}</h3>
+                        <div className="space-y-2 text-gray-200">
+                            <p><strong>Correo:</strong> {clientData.email}</p>
+                            <p><strong>Teléfono:</strong> {clientData.phone}</p>
+                            <p><strong>Edad:</strong> {clientData.isAdult ? 'Mayor de edad' : 'Menor de edad'}</p>
+                            <p><strong>Fecha de Inicio de Membresía:</strong> {clientData.paymentDate}</p>
+                            {calculatePaymentStatus(clientData.paymentDate).text && (
+                                <p className={calculatePaymentStatus(clientData.paymentDate).color}>
+                                    {calculatePaymentStatus(clientData.paymentDate).text}
+                                </p>
+                            )}
+
+                            <h4 className="text-lg md:text-xl font-bold text-purple-400 mt-6 mb-3">Mediciones Corporales:</h4>
+                            {/* Verifica si hay mediciones registradas para mostrar el mensaje */}
+                            {clientData.measurements && measurementOrder.some(key => clientData.measurements[key]) ? (
+                                <ul className="list-disc list-inside space-y-1 text-gray-300">
+                                    {measurementOrder.map((key) => (
+                                        <li key={key}>
+                                            <strong className="capitalize">
+                                                {measurementLabels[key] || key}:
+                                            </strong> {clientData.measurements[key] || 'No registrado'}
+                                        </li>
+                                    ))}
+                                </ul>
+                            ) : (
+                                <p className="text-gray-400 italic">Aún no se han agregado mediciones para este perfil.</p>
+                            )}
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+// Componente principal de la aplicación
+function App() {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [currentScreen, setCurrentScreen] = useState('splash'); // 'splash', 'register', 'admin', 'myStats'
+
+    // Prioriza las variables de entorno de Netlify (process.env), luego las globales de Canvas (typeof __app_id),
+    // y finalmente un valor por defecto si no se encuentran.
+    const appId = process.env.REACT_APP_APP_ID || (typeof __app_id !== 'undefined' ? __app_id : 'default-app-id');
+    const firebaseConfigString = process.env.REACT_APP_FIREBASE_CONFIG || (typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+    useEffect(() => {
+        let firebaseConfig = {};
+        try {
+            // Intenta parsear la configuración de Firebase si la cadena no está vacía o es el objeto vacío por defecto
+            if (firebaseConfigString && firebaseConfigString !== '{}') {
+                firebaseConfig = JSON.parse(firebaseConfigString);
+            } else {
+                console.warn("La cadena de configuración de Firebase está vacía o falta. Firebase no se inicializará.");
+            }
+        } catch (parseError) {
+            console.error("Error al parsear la configuración de Firebase:", parseError);
+            setIsAuthReady(true); // Permite que la app continúe, pero sin Firebase
+            return; // Salir si el parseo falla
+        }
+
+        // Si la configuración de Firebase sigue estando vacía después del parseo, no se inicializa
+        if (Object.keys(firebaseConfig).length === 0) {
+            console.error("La configuración de Firebase está vacía después del parseo. La base de datos no estará disponible.");
+            setIsAuthReady(true); // Permite que la app continúe, pero sin Firebase
+            return; // Salir si la configuración está vacía
+        }
+
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    try {
+                        // Intenta iniciar sesión con el token de Canvas, o de forma anónima si no está disponible
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    } catch (error) {
+                        console.error("Fallo al iniciar sesión anónimamente con Firebase:", error);
+                    }
+                }
+                setIsAuthReady(true); // El estado de autenticación está listo
+            });
+
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Fallo al inicializar la aplicación de Firebase:", error);
+            setIsAuthReady(true); // Permite que la aplicación continúe incluso si la inicialización de Firebase falla
+        }
+    }, [firebaseConfigString]); // El efecto se vuelve a ejecutar si la cadena de configuración cambia
+
+    useEffect(() => {
+        if (isAuthReady) {
+            const splashTimer = setTimeout(() => {
+                setCurrentScreen('register'); // Va directamente a la pantalla de registro
+            }, 3000);
+
+            return () => clearTimeout(splashTimer);
+        }
+    }, [isAuthReady]);
+
+    const renderScreen = () => {
+        if (currentScreen === 'splash') {
+            return <SplashScreen />;
+        } else if (currentScreen === 'register') {
+            return <RegistrationForm db={db} auth={auth} userId={userId} setCurrentScreen={setCurrentScreen} appId={appId} />;
+        } else if (currentScreen === 'admin') {
+            return <AdminDashboard db={db} auth={auth} userId={userId} setCurrentScreen={setCurrentScreen} appId={appId} />;
+        } else if (currentScreen === 'myStats') {
+            return <MyStatistics db={db} auth={auth} userId={userId} setCurrentScreen={setCurrentScreen} appId={appId} />;
+        }
+        return null;
+    };
+
+    return (
+        <div className="font-inter">
+            {renderScreen()}
+        </div>
+    );
+}
+
+export default App;
